@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>2026 Azerbaijan GP — Race speed median</title>
+<style>
+:root{
+  --bg:#101318; --panel:#151a21; --border:#29313b; --grid:#252d37;
+  --text:#e9edf2; --muted:#aab3bf; --axis:#c8d0d9;
+}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:var(--bg);color:var(--text)}
+.wrap{max-width:1500px;margin:auto;padding:18px}
+h1{font-size:20px;margin:0 0 8px}
+.note{color:var(--muted);font-size:13px;margin-bottom:14px;line-height:1.45}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+button,label.file{background:#202631;color:var(--text);border:1px solid #3b4553;border-radius:6px;padding:7px 10px;cursor:pointer;font-size:13px;font-family:inherit}
+button:hover,label.file:hover{background:#2a3340}
+label.file{background:#2b5a8a;border-color:#3d74ab}
+label.file:hover{background:#346aa0}
+input[type=file]{display:none}
+#seriesList{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;min-height:28px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:#1a1f27;border:1px solid #333c48;border-radius:14px;padding:3px 4px 3px 10px;font-size:12px;user-select:none}
+.chip.hidden{opacity:.45}
+.chip .name{cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.chip .dot{width:10px;height:10px;border-radius:50%}
+.chip button{border:none;background:transparent;color:var(--muted);padding:1px 6px;font-size:14px;line-height:1;border-radius:10px}
+.chip button:hover{background:#3a2226;color:#ff8a8a}
+.box{position:relative;border:1px solid var(--border);border-radius:7px;background:var(--bg)}
+#chartBox{height:560px}
+#navBox{height:104px;margin-top:8px}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+#chart{cursor:crosshair}
+#tip{position:absolute;pointer-events:none;background:rgba(21,26,33,.96);border:1px solid #3b4553;border-radius:6px;padding:7px 9px;font-size:12px;line-height:1.5;white-space:nowrap;display:none;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+#tip .h{font-weight:600;margin-bottom:2px}
+#tip .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+#tip .d{color:var(--muted)}
+.navLabel{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:10px}
+.status{font-size:12px;color:var(--muted);margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>2026 Azerbaijan GP — race speed median by track distance</h1>
+<div class="note">
+Main chart: <b>x = track distance (m)</b>, <b>y = speed (km/h)</b>; each series is the median of the selected laps at every 5 m of track.
+Mouse wheel zooms track distance around the cursor, drag selects a zoom range, <b>Shift+drag</b> pans, double-click resets.
+The lap navigator below picks <b>which race laps go into the median</b>: drag the handles, drag the window, or drag across empty space for a new range.
+Click a series name to hide/show it.
+</div>
+<div class="controls">
+<label class="file">Load series… <input id="fileInput" type="file" accept=".csv,text/csv" multiple></label>
+<button id="resetZoom">Reset track zoom</button>
+<button id="allLaps">All laps</button>
+<button id="removeAll">Remove all</button>
+</div>
+<div id="seriesList"></div>
+<div class="box" id="chartBox"><canvas id="chart"></canvas><div id="tip"></div></div>
+<div class="navLabel"><span id="navText">Lap selection</span><span>per-lap average speed</span></div>
+<div class="box" id="navBox"><canvas id="nav"></canvas></div>
+<div class="status" id="status"></div>
+</div>
+
+<script>
+"use strict";
+const TRACK_LENGTH = 6003;          // Baku circuit length, metres (must match the .py)
+const GRID_STEP = 5;                // median grid, metres
+const N = Math.floor(TRACK_LENGTH / GRID_STEP) + 1;
+const MIN_RANGE = 100;              // smallest zoom window, metres
+const PAD = {l:58, r:18, t:14, b:42};
+const NAV_PAD = {t:8, b:22};
+const PALETTE = ['#4ea1ff','#ff6b6b','#ffd166','#06d6a0','#c77dff','#ff9f1c','#4cc9f0','#f72585','#90be6d','#d8dde4','#e76f51','#8ecae6'];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+// name -> {laps:[..], resampled:Map(lap->Float32Array(N)), lapMean:Map(lap->km/h), color, visible, median:Float32Array}
+const series = new Map();
+let lapMin = 1, lapMax = 2, selFrom = 1, selTo = 2;
+let view = {x0:0, x1:TRACK_LENGTH};
+let hoverIdx = null, mainDrag = null, navDrag = null;
+
+/* ---------- data ---------- */
+function parseCSV(text){
+  const lines = text.replace(/^﻿/,'').trim().split(/\r?\n/);
+  if(lines.length < 2) throw new Error('file is empty');
+  const h = lines[0].split(',').map(x=>x.trim());
+  const li=h.indexOf('lap'), di=h.indexOf('distance_m'), si=h.indexOf('speed_kmh');
+  if(li<0||di<0||si<0) throw new Error('CSV must contain lap,distance_m,speed_kmh');
+  const byLap = new Map();
+  for(let i=1;i<lines.length;i++){
+    const p = lines[i].split(',');
+    const lap=+p[li], d=+p[di], s=+p[si];
+    if(!Number.isFinite(lap)||!Number.isFinite(d)||!Number.isFinite(s)) continue;
+    if(!byLap.has(lap)) byLap.set(lap, []);
+    byLap.get(lap).push({d,s});
+  }
+  if(!byLap.size) throw new Error('no valid rows');
+  const resampled = new Map(), lapMean = new Map();
+  for(const [lap, arr] of byLap){
+    arr.sort((a,b)=>a.d-b.d);
+    const r = resample(arr);
+    resampled.set(lap, r);
+    let sum=0, n=0; for(const v of r) if(!Number.isNaN(v)){sum+=v;n++;}
+    if(n) lapMean.set(lap, sum/n);
+  }
+  return {laps:[...byLap.keys()].sort((a,b)=>a-b), resampled, lapMean};
+}
+
+// Linear interpolation of one lap onto the fixed distance grid (done once, at load).
+function resample(arr){
+  const out = new Float32Array(N).fill(NaN);
+  const first = arr[0].d, last = arr[arr.length-1].d;
+  let j = 0;
+  for(let i=0;i<N;i++){
+    const d = i*GRID_STEP;
+    if(d < first || d > last) continue;
+    while(j < arr.length-2 && arr[j+1].d < d) j++;
+    const a = arr[j], b = arr[j+1] || a;
+    out[i] = b.d===a.d ? a.s : a.s + (d-a.d)/(b.d-a.d)*(b.s-a.s);
+  }
+  return out;
+}
+
+function computeMedian(s){
+  const lapArrs = s.laps.filter(l=>l>=selFrom && l<=selTo).map(l=>s.resampled.get(l));
+  const out = new Float32Array(N).fill(NaN), buf = new Float64Array(lapArrs.length);
+  for(let i=0;i<N;i++){
+    let n=0;
+    for(const a of lapArrs){ const v=a[i]; if(!Number.isNaN(v)) buf[n++]=v; }
+    if(!n) continue;
+    const vals = buf.subarray(0,n).sort(), m = n>>1;
+    out[i] = n%2 ? vals[m] : (vals[m-1]+vals[m])/2;
+  }
+  s.median = out;
+}
+const recomputeAll = () => { for(const s of series.values()) computeMedian(s); };
+const lapsInRange = s => s.laps.filter(l=>l>=selFrom && l<=selTo).length;
+
+/* ---------- canvas helpers ---------- */
+function makeSurface(cv){
+  const surf = {cv, ctx:cv.getContext('2d'), w:0, h:0};
+  new ResizeObserver(()=>{
+    const dpr = window.devicePixelRatio || 1, r = cv.getBoundingClientRect();
+    surf.w = r.width; surf.h = r.height;
+    cv.width = Math.round(r.width*dpr); cv.height = Math.round(r.height*dpr);
+    surf.ctx.setTransform(dpr,0,0,dpr,0,0);
+    draw();
+  }).observe(cv);
+  return surf;
+}
+function niceTicks(min, max, count){
+  const span = max-min || 1, raw = span/count, mag = 10**Math.floor(Math.log10(raw));
+  const step = [1,2,2.5,5,10].map(m=>m*mag).find(s=>s>=raw);
+  const ticks = [];
+  for(let v=Math.ceil(min/step)*step; v<=max+step*1e-9; v+=step) ticks.push(+v.toFixed(10));
+  return {ticks, step};
+}
+let raf = 0;
+function draw(){ if(!raf) raf = requestAnimationFrame(()=>{ raf=0; drawMain(); drawNav(); updateStatus(); }); }
+
+/* ---------- main chart ---------- */
+const M = makeSurface(document.getElementById('chart'));
+let yScale = {y0:0, y1:350};
+const plotL = () => PAD.l, plotR = () => M.w-PAD.r, plotT = () => PAD.t, plotB = () => M.h-PAD.b;
+const xToPx = d => plotL() + (d-view.x0)/(view.x1-view.x0)*(plotR()-plotL());
+const pxToX = px => view.x0 + (px-plotL())/(plotR()-plotL())*(view.x1-view.x0);
+const yToPx = v => plotB() - (v-yScale.y0)/(yScale.y1-yScale.y0)*(plotB()-plotT());
+
+function clampView(x0, x1){
+  let w = Math.min(TRACK_LENGTH, Math.max(MIN_RANGE, x1-x0));
+  if(x1-x0 < w){ const c=(x0+x1)/2; x0=c-w/2; x1=c+w/2; }
+  if(x0 < 0){ x1 -= x0; x0 = 0; }
+  if(x1 > TRACK_LENGTH){ x0 -= x1-TRACK_LENGTH; x1 = TRACK_LENGTH; }
+  view = {x0:Math.max(0,x0), x1:Math.min(TRACK_LENGTH,x1)};
+}
+
+function drawMain(){
+  const {ctx, w, h} = M; if(!w) return;
+  ctx.clearRect(0,0,w,h);
+  const L=plotL(), R=plotR(), T=plotT(), B=plotB();
+  const vis = [...series.values()].filter(s=>s.visible && s.median);
+  const i0 = Math.max(0, Math.floor(view.x0/GRID_STEP)-1), i1 = Math.min(N-1, Math.ceil(view.x1/GRID_STEP)+1);
+
+  // y axis adapts to what is visible in the current zoom window
+  let lo=Infinity, hi=-Infinity;
+  for(const s of vis) for(let i=i0;i<=i1;i++){ const v=s.median[i]; if(!Number.isNaN(v)){ if(v<lo)lo=v; if(v>hi)hi=v; } }
+  if(lo===Infinity){ lo=0; hi=350; }
+  const padY = Math.max(3, (hi-lo)*0.03);
+  const yStep = niceTicks(lo-padY, hi+padY, 8).step;
+  yScale = {y0: Math.max(lo>=0?0:-Infinity, Math.floor((lo-padY)/yStep)*yStep), y1: Math.ceil((hi+padY)/yStep)*yStep};
+  const yticks = [];
+  for(let v=yScale.y0; v<=yScale.y1+1e-9; v+=yStep) yticks.push(+v.toFixed(6));
+  const xticks = niceTicks(view.x0, view.x1, Math.max(3, Math.floor((R-L)/90))).ticks;
+
+  ctx.font = '12px system-ui,-apple-system,Segoe UI,sans-serif';
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = css('--grid'); ctx.fillStyle = css('--muted');
+  ctx.textAlign='right'; ctx.textBaseline='middle';
+  for(const v of yticks){ const y=Math.round(yToPx(v))+.5; ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(R,y); ctx.stroke(); ctx.fillText(v, L-8, y); }
+  ctx.textAlign='center'; ctx.textBaseline='top';
+  for(const v of xticks){ const x=Math.round(xToPx(v))+.5; ctx.beginPath(); ctx.moveTo(x,B); ctx.lineTo(x,B+5); ctx.stroke(); ctx.fillText(v.toLocaleString('en-US'), x, B+8); }
+  ctx.strokeStyle = '#3b4553'; ctx.beginPath(); ctx.moveTo(L,B+.5); ctx.lineTo(R,B+.5); ctx.stroke();
+
+  ctx.fillStyle = css('--axis'); ctx.font = '13px system-ui,-apple-system,Segoe UI,sans-serif';
+  ctx.fillText('Track distance (m)', (L+R)/2, h-17);
+  ctx.save(); ctx.translate(15,(T+B)/2); ctx.rotate(-Math.PI/2); ctx.textBaseline='middle'; ctx.fillText('Car speed (km/h)',0,0); ctx.restore();
+
+  if(!series.size){
+    ctx.fillStyle = css('--muted'); ctx.textBaseline='middle';
+    ctx.fillText('Load one or more CSV files to start', (L+R)/2, (T+B)/2);
+  }
+
+  // series lines
+  ctx.save(); ctx.beginPath(); ctx.rect(L,T-2,R-L,B-T+4); ctx.clip();
+  ctx.lineWidth = 1.6; ctx.lineJoin='round';
+  for(const s of vis){
+    ctx.strokeStyle = s.color; ctx.beginPath(); let pen=false;
+    for(let i=i0;i<=i1;i++){
+      const v=s.median[i];
+      if(Number.isNaN(v)){ pen=false; continue; }
+      const x=xToPx(i*GRID_STEP), y=yToPx(v);
+      pen ? ctx.lineTo(x,y) : ctx.moveTo(x,y); pen=true;
+    }
+    ctx.stroke();
+  }
+  // crosshair + markers
+  if(hoverIdx!=null && !mainDrag){
+    const x = Math.round(xToPx(hoverIdx*GRID_STEP))+.5;
+    ctx.strokeStyle='rgba(200,208,217,.35)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,T); ctx.lineTo(x,B); ctx.stroke();
+    for(const s of vis){ const v=s.median[hoverIdx]; if(Number.isNaN(v)) continue;
+      ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(x, yToPx(v), 3.5, 0, Math.PI*2); ctx.fill(); }
+  }
+  ctx.restore();
+
+  // drag-to-zoom selection
+  if(mainDrag && mainDrag.mode==='select'){
+    const a=Math.max(L,Math.min(mainDrag.startX,mainDrag.curX)), b=Math.min(R,Math.max(mainDrag.startX,mainDrag.curX));
+    ctx.fillStyle='rgba(78,161,255,.14)'; ctx.fillRect(a,T,b-a,B-T);
+    ctx.strokeStyle='rgba(78,161,255,.6)'; ctx.strokeRect(a+.5,T+.5,b-a-1,B-T-1);
+  }
+}
+
+const tip = document.getElementById('tip');
+function updateTip(px, py){
+  const vis = [...series.values()].filter(s=>s.visible && s.median);
+  if(hoverIdx==null || !vis.length){ tip.style.display='none'; return; }
+  const rows = vis.map(s=>({s, v:s.median[hoverIdx]})).filter(r=>!Number.isNaN(r.v));
+  if(!rows.length){ tip.style.display='none'; return; }
+  const ref = rows[0].v;
+  tip.innerHTML = `<div class="h">${(hoverIdx*GRID_STEP).toLocaleString('en-US')} m</div>` + rows.map((r,k)=>
+    `<div><span class="dot" style="background:${r.s.color}"></span>${escapeHtml(r.s.name)}: <b>${r.v.toFixed(1)}</b> km/h` +
+    (k ? ` <span class="d">(${r.v-ref>=0?'+':''}${(r.v-ref).toFixed(1)} vs ${escapeHtml(rows[0].s.name)})</span>` : '') + `</div>`).join('');
+  tip.style.display='block';
+  const bw=tip.offsetWidth, bh=tip.offsetHeight;
+  let left = px+16; if(left+bw > M.w-4) left = px-16-bw;
+  let top = Math.min(Math.max(4, py-bh/2), M.h-bh-4);
+  tip.style.left = Math.max(4,left)+'px'; tip.style.top = top+'px';
+}
+
+const chartCv = M.cv;
+chartCv.addEventListener('wheel', e=>{
+  e.preventDefault();
+  const x = Math.max(plotL(), Math.min(plotR(), e.offsetX));
+  const frac = (x-plotL())/(plotR()-plotL()), center = pxToX(x);
+  const w = (view.x1-view.x0) * (e.deltaY<0 ? 0.82 : 1/0.82);
+  clampView(center-frac*w, center+(1-frac)*w);
+  draw(); updateTip(e.offsetX, e.offsetY);
+}, {passive:false});
+
+chartCv.addEventListener('pointerdown', e=>{
+  if(e.button!==0 || e.offsetX<plotL() || e.offsetX>plotR()) return;
+  chartCv.setPointerCapture(e.pointerId);
+  mainDrag = {mode: e.shiftKey ? 'pan' : 'select', startX:e.offsetX, curX:e.offsetX, v0:{...view}};
+  if(mainDrag.mode==='pan') chartCv.style.cursor='grabbing';
+  tip.style.display='none'; draw();
+});
+chartCv.addEventListener('pointermove', e=>{
+  if(mainDrag){
+    mainDrag.curX = e.offsetX;
+    if(mainDrag.mode==='pan'){
+      const {v0} = mainDrag, dx = (e.offsetX-mainDrag.startX)/(plotR()-plotL())*(v0.x1-v0.x0);
+      clampView(v0.x0-dx, v0.x1-dx);
+    }
+    draw(); return;
+  }
+  const inside = e.offsetX>=plotL() && e.offsetX<=plotR() && e.offsetY>=plotT() && e.offsetY<=plotB();
+  hoverIdx = inside && series.size ? Math.max(0, Math.min(N-1, Math.round(pxToX(e.offsetX)/GRID_STEP))) : null;
+  draw(); updateTip(e.offsetX, e.offsetY);
+});
+function endMainDrag(){
+  if(!mainDrag) return;
+  if(mainDrag.mode==='select' && Math.abs(mainDrag.curX-mainDrag.startX) > 6){
+    const a=pxToX(Math.max(plotL(),Math.min(mainDrag.startX,mainDrag.curX)));
+    const b=pxToX(Math.min(plotR(),Math.max(mainDrag.startX,mainDrag.curX)));
+    clampView(a,b);
+  }
+  mainDrag=null; chartCv.style.cursor=''; draw();
+}
+chartCv.addEventListener('pointerup', endMainDrag);
+chartCv.addEventListener('pointercancel', endMainDrag);
+chartCv.addEventListener('pointerleave', ()=>{ if(!mainDrag){ hoverIdx=null; tip.style.display='none'; draw(); } });
+chartCv.addEventListener('dblclick', ()=>{ clampView(0,TRACK_LENGTH); draw(); });
+
+/* ---------- lap navigator ---------- */
+const V = makeSurface(document.getElementById('nav'));
+const navL = () => PAD.l, navR = () => V.w-PAD.r;
+const lapToPx = l => navL() + (l-(lapMin-.5))/(lapMax-lapMin+1)*(navR()-navL());
+const pxToLap = px => (lapMin-.5) + (px-navL())/(navR()-navL())*(lapMax-lapMin+1);
+const clampLap = l => Math.max(lapMin, Math.min(lapMax, l));
+
+function drawNav(){
+  const {ctx, w, h} = V; if(!w) return;
+  ctx.clearRect(0,0,w,h);
+  const L=navL(), R=navR(), T=NAV_PAD.t, B=h-NAV_PAD.b;
+  ctx.fillStyle = css('--panel'); ctx.fillRect(L,T,R-L,B-T);
+
+  // per-lap average speed per series (shows safety-car / slow laps at a glance)
+  const vis = [...series.values()].filter(s=>s.visible);
+  let lo=Infinity, hi=-Infinity;
+  for(const s of vis) for(const v of s.lapMean.values()){ if(v<lo)lo=v; if(v>hi)hi=v; }
+  if(lo<Infinity){
+    const span = Math.max(1, hi-lo), yp = v => B-4 - (v-lo)/span*(B-T-8);
+    ctx.lineWidth=1.2;
+    for(const s of vis){
+      ctx.strokeStyle=s.color; ctx.globalAlpha=.85; ctx.beginPath(); let prev=null;
+      for(const l of s.laps){ const v=s.lapMean.get(l); if(v==null) continue;
+        const x=lapToPx(l), y=yp(v);
+        (prev!=null && l===prev+1) ? ctx.lineTo(x,y) : ctx.moveTo(x,y); prev=l; }
+      ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+  }
+
+  // lap ticks
+  ctx.font='11px system-ui,-apple-system,Segoe UI,sans-serif'; ctx.fillStyle=css('--muted'); ctx.textAlign='center'; ctx.textBaseline='top';
+  const step = niceTicks(lapMin, lapMax, Math.max(3, Math.floor((R-L)/60))).step;
+  const st = Math.max(1, Math.round(step));
+  for(let l=Math.ceil(lapMin/st)*st; l<=lapMax; l+=st){ const x=lapToPx(l); ctx.fillText(l, x, B+5); }
+
+  if(!series.size){ ctx.strokeStyle=css('--border'); ctx.strokeRect(L+.5,T+.5,R-L-1,B-T-1); return; }
+
+  // selection window with masked outside area
+  const a=lapToPx(selFrom-.5), b=lapToPx(selTo+.5);
+  ctx.fillStyle='rgba(8,10,14,.62)'; ctx.fillRect(L,T,a-L,B-T); ctx.fillRect(b,T,R-b,B-T);
+  ctx.fillStyle='rgba(130,145,165,.12)'; ctx.fillRect(a,T,b-a,B-T);
+  ctx.strokeStyle='#8e98a5'; ctx.lineWidth=1; ctx.strokeRect(Math.round(a)+.5,T+.5,Math.round(b-a)-1,B-T-1);
+  for(const x of [a,b]){
+    const hx=Math.round(x)-4, hy=(T+B)/2-11;
+    ctx.fillStyle='#d9dee5'; ctx.strokeStyle='#8e98a5';
+    ctx.beginPath(); ctx.roundRect ? ctx.roundRect(hx,hy,8,22,2) : ctx.rect(hx,hy,8,22); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle='#6b7480'; ctx.beginPath(); ctx.moveTo(hx+3,hy+6); ctx.lineTo(hx+3,hy+16); ctx.moveTo(hx+5,hy+6); ctx.lineTo(hx+5,hy+16); ctx.stroke();
+  }
+}
+
+function navHit(x){
+  const a=lapToPx(selFrom-.5), b=lapToPx(selTo+.5);
+  if(Math.abs(x-a) <= 8) return 'left';
+  if(Math.abs(x-b) <= 8) return 'right';
+  if(x>a && x<b) return 'move';
+  return 'new';
+}
+const navCv = V.cv;
+navCv.addEventListener('pointerdown', e=>{
+  if(e.button!==0 || !series.size) return;
+  navCv.setPointerCapture(e.pointerId);
+  const mode = navHit(e.offsetX);
+  navDrag = {mode, startLap:pxToLap(e.offsetX), f0:selFrom, t0:selTo};
+  if(mode==='new'){ const l=clampLap(Math.round(navDrag.startLap)); setSelection(l,l); }
+  navCv.style.cursor = mode==='move' ? 'grabbing' : 'ew-resize';
+});
+navCv.addEventListener('pointermove', e=>{
+  if(!navDrag){
+    const m = series.size ? navHit(e.offsetX) : '';
+    navCv.style.cursor = m==='left'||m==='right' ? 'ew-resize' : m==='move' ? 'grab' : m==='new' ? 'crosshair' : 'default';
+    return;
+  }
+  const lap = pxToLap(e.offsetX), {mode, f0, t0} = navDrag;
+  if(mode==='left')  setSelection(Math.min(t0, clampLap(Math.round(lap+.5))), t0);
+  if(mode==='right') setSelection(f0, Math.max(f0, clampLap(Math.round(lap-.5))));
+  if(mode==='move'){
+    const width=t0-f0, nf=Math.max(lapMin, Math.min(lapMax-width, f0+Math.round(lap-navDrag.startLap)));
+    setSelection(nf, nf+width);
+  }
+  if(mode==='new'){
+    const a=clampLap(Math.round(navDrag.startLap)), b=clampLap(Math.round(lap));
+    setSelection(Math.min(a,b), Math.max(a,b));
+  }
+});
+const endNavDrag = ()=>{ navDrag=null; navCv.style.cursor=''; };
+navCv.addEventListener('pointerup', endNavDrag);
+navCv.addEventListener('pointercancel', endNavDrag);
+
+function setSelection(f, t){
+  if(f===selFrom && t===selTo) return;
+  selFrom=f; selTo=t; recomputeAll(); refreshUI();
+}
+
+/* ---------- series management / UI ---------- */
+function updateStatus(){
+  const f = v => Math.round(v).toLocaleString('en-US');
+  document.getElementById('status').textContent = series.size
+    ? `${series.size} series loaded. Track view: ${f(view.x0)}–${f(view.x1)} m.`
+    : 'Load one or more CSV files (columns: lap,distance_m,speed_kmh). The file name becomes the series name.';
+}
+function updateLapBounds(forceAll){
+  const wasAll = forceAll || (selFrom===lapMin && selTo===lapMax);
+  const all = [...series.values()].flatMap(s=>s.laps);
+  lapMin = all.length ? Math.min(...all) : 1;
+  lapMax = all.length ? Math.max(...all) : 2;
+  if(wasAll){ selFrom=lapMin; selTo=lapMax; }
+  selFrom = clampLap(selFrom); selTo = Math.max(selFrom, clampLap(selTo));
+}
+function nextColor(){
+  const used = new Set([...series.values()].map(s=>s.color));
+  return PALETTE.find(c=>!used.has(c)) || PALETTE[series.size % PALETTE.length];
+}
+async function loadFiles(files){
+  const errors=[];
+  const first = !series.size;
+  for(const f of files){
+    const name = f.name.replace(/\.csv$/i,'');
+    try{
+      const parsed = parseCSV(await f.text());
+      const old = series.get(name);                 // same name replaces, keeps colour
+      series.set(name, {name, ...parsed, color: old ? old.color : nextColor(), visible: old ? old.visible : true});
+    }catch(err){ errors.push(`${f.name}: ${err.message}`); }
+  }
+  updateLapBounds(first);
+  recomputeAll(); refreshUI();
+  if(errors.length) alert('Some files could not be loaded:\n'+errors.join('\n'));
+}
+function removeSeries(name){
+  series.delete(name);
+  updateLapBounds(); recomputeAll(); refreshUI();
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function refreshUI(){
+  const box = document.getElementById('seriesList'); box.innerHTML='';
+  for(const s of series.values()){
+    const chip=document.createElement('span'); chip.className='chip'+(s.visible?'':' hidden');
+    const nm=document.createElement('span'); nm.className='name'; nm.title='Click to hide/show';
+    const dot=document.createElement('span'); dot.className='dot'; dot.style.background=s.color;
+    const label=document.createElement('span'); label.textContent=`${s.name} (${lapsInRange(s)} laps)`;
+    nm.append(dot,label); nm.onclick=()=>{ s.visible=!s.visible; refreshUI(); };
+    const del=document.createElement('button'); del.textContent='✕'; del.title='Remove '+s.name;
+    del.onclick=()=>removeSeries(s.name);
+    chip.append(nm,del); box.append(chip);
+  }
+  document.getElementById('navText').textContent = series.size
+    ? `Median of laps ${selFrom}–${selTo} (${selTo-selFrom+1} of ${lapMax-lapMin+1})` : 'Lap selection';
+  draw();
+}
+document.getElementById('fileInput').addEventListener('change', async e=>{
+  const files=[...e.target.files]; e.target.value='';
+  if(files.length) await loadFiles(files);
+});
+document.getElementById('resetZoom').onclick = ()=>{ clampView(0,TRACK_LENGTH); draw(); };
+document.getElementById('allLaps').onclick = ()=>setSelection(lapMin, lapMax);
+document.getElementById('removeAll').onclick = ()=>{ series.clear(); updateLapBounds(); refreshUI(); };
+refreshUI();
+</script>
+</body>
+</html>
